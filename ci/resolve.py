@@ -19,7 +19,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-API = "https://androidbuildinternal.googleapis.com/android/internal/build/v3/builds"
+# Google's legacy Build API answers `403 Rate limit exceeded for legacy API` to every unauthenticated
+# client, from a Mac and from a GitHub runner alike. `status.json` is the public page the build
+# dashboard itself reads, and it carries the last known good build id, which is all we need: the
+# artifact host (ci.android.com/builds/submitted/...) serves bytes without an API key.
+STATUS = "https://ci.android.com/builds/branches/{branch}/status.json"
 SUBMITTED = "https://ci.android.com/builds/submitted/{build_id}/{target}/latest/{name}"
 TIMEOUT = 60
 
@@ -87,27 +91,26 @@ def main(argv: list[str]) -> int:
         }
         return emit(result)
 
-    query = urllib.parse.urlencode(
-        {
-            "branch": branch,
-            "target": target,
-            "buildAttemptStatus": "complete",
-            "successful": "true",
-            "maxResults": 1,
-        }
-    )
     try:
-        payload = json.loads(get(f"{API}?{query}"))
+        status = json.loads(get(STATUS.format(branch=branch)))
     except urllib.error.HTTPError as error:
         body = error.read().decode("utf-8", "replace")[:400]
-        fail(3, f"build API answered {error.code}: {body}")
+        fail(3, f"status.json answered {error.code}: {body}")
     except urllib.error.URLError as error:
-        fail(3, f"build API unreachable: {error.reason}")
+        fail(3, f"status.json unreachable: {error.reason}")
 
-    builds = payload.get("builds") or []
-    if not builds:
-        fail(4, f"no completed build for branch={branch} target={target}")
-    build_id = builds[0]["buildId"]
+    published = [
+        entry
+        for entry in status.get("targets", [])
+        if entry.get("name") == target or entry.get("ID", "").endswith(f".{target}")
+    ]
+    if not published:
+        names = ", ".join(sorted(entry.get("name", "?") for entry in status.get("targets", [])))
+        fail(4, f"branch {branch} does not publish target {target}; it publishes: {names}")
+    entry = published[0]
+    build_id = entry.get("last_known_good_build") or entry.get("first_known_good_build")
+    if not build_id:
+        fail(4, f"target {target} on {branch} has no known-good build listed")
 
     image_url = ""
     for product in product_candidates(target):
@@ -122,7 +125,7 @@ def main(argv: list[str]) -> int:
 
     host_package = SUBMITTED.format(build_id=build_id, target=target, name="cvd-host_package.tar.gz")
     result = {
-        "source": "build-api",
+        "source": "status.json",
         "image_url": image_url,
         "image_sha256": image_sha256,
         "host_package_url": host_package if head_ok(host_package) else "",

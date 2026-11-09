@@ -21,10 +21,11 @@ Google's internal build API. CarbonHV consumes the published bundle by hash.
 
 ## What the workflow does
 
-1. **Resolve** the newest completed build for the branch and target, through the public build API.
-   If the API refuses (it rate-limits unauthenticated legacy clients), the job fails with the
-   exact failure and the two ways forward: pass `image_url` + `image_sha256` explicitly, or build
-   from source in the GrapheneOS-derived repository.
+1. **Resolve** the newest known-good build for the branch and target from
+   `ci.android.com/builds/branches/<branch>/status.json`, then probe the artifact names Cuttlefish
+   publishes for that product. Google's *build API* refuses unauthenticated clients — from a Mac
+   and from a GitHub runner alike, `403 Rate limit exceeded for legacy API` — so the workflow does
+   not depend on it. The artifact host serves the bytes without a key.
 2. **Download** the image zip and `cvd-host_package.tar.gz`, then **verify** the checksum the API
    advertises. A mismatch is fatal.
 3. **Repack**: unpack the image zip, keep `boot.img`, `init_boot.img`, `vendor_boot.img`,
