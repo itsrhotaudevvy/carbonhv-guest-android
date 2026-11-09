@@ -81,6 +81,13 @@ jobs:
             echo "checksum mismatch: the file is not the one that was pinned" >&2
             exit 5
           fi
+          # The artifact host has served an HTML viewer page instead of bytes, so check the magic
+          # here rather than letting the repack step discover it after a 1.1 GB download.
+          if [[ "$(head -c 2 download/aosp-cuttlefish-image.zip)" != "PK" ]]; then
+            echo "download is not a zip; first bytes: $(head -c 120 download/aosp-cuttlefish-image.zip | tr -d '\0' | head -1)" >&2
+            exit 6
+          fi
+          du -h download/aosp-cuttlefish-image.zip
           printf 'image_sha256=%s\n' "$actual" >>"$GITHUB_OUTPUT"
         id: verify
 

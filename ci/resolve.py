@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -58,6 +59,24 @@ def head_ok(url: str) -> bool:
     except urllib.error.URLError as error:
         print(f"resolve: HEAD {url} -> {error.reason}", file=sys.stderr)
         return False
+
+
+def signed_url(viewer_url: str) -> str:
+    """Turns a ci.android.com Artifact Viewer URL into the signed storage URL it embeds.
+
+    Since 2025 the submitted-artifact path serves an HTML viewer, not bytes: a plain GET returns
+    `text/html` with the file's signed Cloud Storage URL inside it. The signature is what makes the
+    object readable without credentials, and it expires, so the URL is resolved and used in the
+    same run rather than cached.
+    """
+    page = get(viewer_url).decode("utf-8", "replace")
+    match = re.search(
+        r"https://storage\.googleapis\.com/android-build/[^\"'\\\s]+(?:\\u0026[^\"'\\\s]+)*",
+        page,
+    )
+    if not match:
+        return ""
+    return match.group(0).replace("\\u0026", "&")
 
 
 def product_candidates(target: str) -> list[str]:
@@ -112,16 +131,27 @@ def main(argv: list[str]) -> int:
     if not build_id:
         fail(4, f"target {target} on {branch} has no known-good build listed")
 
-    image_url = ""
+    viewer_url = ""
     for product in product_candidates(target):
         candidate = SUBMITTED.format(
             build_id=build_id, target=target, name=f"{product}-img-{build_id}.zip"
         )
         if head_ok(candidate):
-            image_url = candidate
+            viewer_url = candidate
             break
-    if not image_url:
+    if not viewer_url:
         fail(5, f"build {build_id}: none of the expected image artifact names answered 200")
+
+    image_url = signed_url(viewer_url)
+    if image_url:
+        print(f"resolve: signed artifact url for build {build_id}", file=sys.stderr)
+    else:
+        print(
+            "resolve: the artifact page carried no signed url; downloading the viewer page instead,\n"
+            "resolve: which will fail the zip check below rather than being repacked as an image",
+            file=sys.stderr,
+        )
+        image_url = viewer_url
 
     host_package = SUBMITTED.format(build_id=build_id, target=target, name="cvd-host_package.tar.gz")
     result = {
