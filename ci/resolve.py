@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Resolves which published AOSP build to download, without guessing silently.
+
+Two ways in:
+  * nothing passed  -> ask the public build API for the newest completed build and probe the
+                       artifact names that Cuttlefish publishes for that product;
+  * image_url given -> use it verbatim, no API call at all (this is the path to use when a human
+                       downloaded the image in a browser and dropped it somewhere reachable).
+
+Everything it decides goes to stdout as JSON and to $GITHUB_OUTPUT when running in Actions, so a
+failed run leaves a record of which URLs were tried and what each of them answered.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API = "https://androidbuildinternal.googleapis.com/android/internal/build/v3/builds"
+SUBMITTED = "https://ci.android.com/builds/submitted/{build_id}/{target}/latest/{name}"
+TIMEOUT = 60
+
+
+def fail(code: int, message: str) -> "NoReturn":  # type: ignore[name-defined]
+    print(f"resolve: {message}", file=sys.stderr)
+    print(
+        "resolve: if the build API refuses, dispatch this workflow with image_url and\n"
+        "resolve: image_sha256 for a file downloaded by hand, or build from source in the\n"
+        "resolve: carbonhv-guest-grapheneos repository.",
+        file=sys.stderr,
+    )
+    raise SystemExit(code)
+
+
+def get(url: str) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": "carbonhv-guest-android/1"})
+    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        return response.read()
+
+
+def head_ok(url: str) -> bool:
+    request = urllib.request.Request(
+        url, method="HEAD", headers={"User-Agent": "carbonhv-guest-android/1"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            return response.status == 200
+    except urllib.error.HTTPError as error:
+        print(f"resolve: HEAD {url} -> {error.code}", file=sys.stderr)
+        return False
+    except urllib.error.URLError as error:
+        print(f"resolve: HEAD {url} -> {error.reason}", file=sys.stderr)
+        return False
+
+
+def product_candidates(target: str) -> list[str]:
+    """Artifact names are built from the product name, which is the target without its variant.
+
+    `aosp_cf_arm64_only_phone-userdebug` publishes as either the full product name or the older
+    `aosp_cf_arm64_phone`, depending on the branch, so both are tried and the log says which won.
+    """
+    base = target.rsplit("-", 1)[0]
+    candidates = [base]
+    if base.endswith("_only_phone"):
+        candidates.append(base.replace("_only_phone", "_phone"))
+    return candidates
+
+
+def main(argv: list[str]) -> int:
+    branch = argv[1] if len(argv) > 1 else "aosp-android-latest-release"
+    target = argv[2] if len(argv) > 2 else "aosp_cf_arm64_only_phone-userdebug"
+    image_url = argv[3] if len(argv) > 3 else ""
+    image_sha256 = argv[4] if len(argv) > 4 else ""
+
+    if image_url:
+        result = {
+            "source": "explicit-url",
+            "image_url": image_url,
+            "image_sha256": image_sha256,
+            "host_package_url": "",
+            "build_id": "",
+            "branch": branch,
+            "target": target,
+        }
+        return emit(result)
+
+    query = urllib.parse.urlencode(
+        {
+            "branch": branch,
+            "target": target,
+            "buildAttemptStatus": "complete",
+            "successful": "true",
+            "maxResults": 1,
+        }
+    )
+    try:
+        payload = json.loads(get(f"{API}?{query}"))
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", "replace")[:400]
+        fail(3, f"build API answered {error.code}: {body}")
+    except urllib.error.URLError as error:
+        fail(3, f"build API unreachable: {error.reason}")
+
+    builds = payload.get("builds") or []
+    if not builds:
+        fail(4, f"no completed build for branch={branch} target={target}")
+    build_id = builds[0]["buildId"]
+
+    image_url = ""
+    for product in product_candidates(target):
+        candidate = SUBMITTED.format(
+            build_id=build_id, target=target, name=f"{product}-img-{build_id}.zip"
+        )
+        if head_ok(candidate):
+            image_url = candidate
+            break
+    if not image_url:
+        fail(5, f"build {build_id}: none of the expected image artifact names answered 200")
+
+    host_package = SUBMITTED.format(build_id=build_id, target=target, name="cvd-host_package.tar.gz")
+    result = {
+        "source": "build-api",
+        "image_url": image_url,
+        "image_sha256": image_sha256,
+        "host_package_url": host_package if head_ok(host_package) else "",
+        "build_id": build_id,
+        "branch": branch,
+        "target": target,
+    }
+    return emit(result)
+
+
+def emit(result: dict) -> int:
+    text = json.dumps(result, indent=2, sort_keys=True)
+    print(text)
+    output = os.environ.get("GITHUB_OUTPUT")
+    if output:
+        with open(output, "a", encoding="utf-8") as handle:
+            for key, value in result.items():
+                handle.write(f"{key}={value}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

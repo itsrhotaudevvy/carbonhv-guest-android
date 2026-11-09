@@ -1,0 +1,134 @@
+name: Fetch AOSP Cuttlefish stand-in guest
+
+# Downloads an officially published AOSP Cuttlefish ARM64 image, verifies it, repacks it into the
+# CarbonHV artifact layout and publishes the bundle with provenance. It builds no Android source
+# and it is not GrapheneOS: the bundle manifest says `android-standin` in its own file.
+#
+# Two ways to run it:
+#   * no inputs  -> resolve the newest completed build through the public build API;
+#   * image_url  -> use a file downloaded by hand (this is the reliable path, because Google's
+#                   legacy build API rate-limits unauthenticated clients).
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: AOSP branch to take the newest build from
+        default: aosp-android-latest-release
+      target:
+        description: Build target
+        default: aosp_cf_arm64_only_phone-userdebug
+      image_url:
+        description: Exact image zip URL (skips build resolution)
+        default: ""
+      image_sha256:
+        description: Expected SHA-256 of the image zip (required with image_url to be a check)
+        default: ""
+      release_tag:
+        description: Publish the bundle as a release with this tag (empty = artifact only)
+        default: ""
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Free disk space
+        # The image plus its repacked copy does not fit beside the preinstalled toolchains.
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+
+      - name: Resolve build
+        id: resolve
+        run: |
+          python3 ci/resolve.py \
+            "${{ inputs.branch || 'aosp-android-latest-release' }}" \
+            "${{ inputs.target || 'aosp_cf_arm64_only_phone-userdebug' }}" \
+            "${{ inputs.image_url }}" \
+            "${{ inputs.image_sha256 }}"
+
+      - name: Download image
+        run: |
+          set -euo pipefail
+          mkdir -p download
+          url="${{ steps.resolve.outputs.image_url }}"
+          name="aosp-cuttlefish-image.zip"
+          echo "downloading $url"
+          curl --fail --location --retry 3 --retry-delay 5 --output "download/$name" -- "$url"
+          ls -l download/
+
+      - name: Verify download
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum download/aosp-cuttlefish-image.zip | awk '{print $1}')"
+          expected="${{ steps.resolve.outputs.image_sha256 }}"
+          echo "actual   $actual"
+          echo "expected ${expected:-<not supplied>}"
+          if [[ -n "$expected" && "$actual" != "$expected" ]]; then
+            echo "checksum mismatch: the file is not the one that was pinned" >&2
+            exit 5
+          fi
+          printf 'image_sha256=%s\n' "$actual" >>"$GITHUB_OUTPUT"
+        id: verify
+
+      - name: Repack into the CarbonHV bundle layout
+        run: |
+          set -euo pipefail
+          build_id="${{ steps.resolve.outputs.build_id }}"
+          ci/repack.sh download/aosp-cuttlefish-image.zip out "${build_id:-manual}"
+          cat out/partitions.txt
+
+      - name: Write provenance
+        run: |
+          set -euo pipefail
+          {
+            echo "fetched_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "source=${{ steps.resolve.outputs.source }}"
+            echo "branch=${{ steps.resolve.outputs.branch }}"
+            echo "target=${{ steps.resolve.outputs.target }}"
+            echo "build_id=${{ steps.resolve.outputs.build_id }}"
+            echo "image_url=${{ steps.resolve.outputs.image_url }}"
+            echo "image_sha256=${{ steps.verify.outputs.image_sha256 }}"
+            echo "toolchain=python3 $(python3 -V 2>&1 | cut -d' ' -f2), unzip $(unzip -v | head -1 | awk '{print $2}')"
+            echo "workflow_run=${{ github.run_id }}"
+            echo "note=official AOSP Cuttlefish image repacked by CarbonHV CI; NOT GrapheneOS"
+          } >out/provenance.txt
+          cat out/provenance.txt
+
+      - name: Name the artifact
+        id: name
+        run: |
+          id="${{ steps.resolve.outputs.build_id }}"
+          echo "bundle=carbonhv-guest-android-standin-${id:-manual}" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.bundle }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release
+        if: ${{ inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.release_tag }}"
+          ( cd out && sha256sum artifacts/* >SHA256SUMS )
+          gh release create "$tag" out --title "$tag" \
+            --notes "AOSP Cuttlefish ARM64 stand-in guest, repacked for CarbonHV. Not GrapheneOS; see out/bundle.toml and out/provenance.txt." \
+            || gh release upload "$tag" out --clobber
