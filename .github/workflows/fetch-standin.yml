@@ -88,7 +88,7 @@ jobs:
         run: |
           set -euo pipefail
           build_id="${{ steps.resolve.outputs.build_id }}"
-          ci/repack.sh download/aosp-cuttlefish-image.zip out "${build_id:-manual}"
+          bash ci/repack.sh download/aosp-cuttlefish-image.zip out "${build_id:-manual}"
           cat out/partitions.txt
 
       - name: Write provenance
